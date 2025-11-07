@@ -48,9 +48,9 @@ class _GoongRoutingMapState extends State<GoongRoutingMap> {
 
   final TextEditingController _endCtrl = TextEditingController();
 
-  final String _goongMapKey = "d4wzBWgAIyb3EvELksUXwTLrIKGlZPd4KFGrATgj";
+  final String _goongMapKey = "xxx";
 
-  final String _goongApiKey = "xdfsmGusMta5D9ICaSarzdmCWWOucKDKiWRbbbaq";
+  final String _goongApiKey = "xxx";
 
   // --- CÁC BIẾN MỚI CHO NAVIGATION ---
 
@@ -76,9 +76,7 @@ class _GoongRoutingMapState extends State<GoongRoutingMap> {
   void initState() {
     super.initState();
 
-    mapbox.MapboxOptions.setAccessToken(
-      "pk.eyJ1IjoiZHVjLWRheS1uZSIsImEiOiJjbWg0N3ZndGswZmNwMmpuNGN1cTJnYjlxIn0.m0RNPqi3Z6NYjy9_Mr1eEw",
-    );
+    mapbox.MapboxOptions.setAccessToken("xxx");
 
     _loadIcon();
   }
