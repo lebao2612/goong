@@ -48,9 +48,9 @@ class _GoongRoutingMapState extends State<GoongRoutingMap> {
 
   final TextEditingController _endCtrl = TextEditingController();
 
-  final String _goongMapKey = "xxx";
+  final String _goongMapKey = "d4wzBWgAIyb3EvELksUXwTLrIKGlZPd4KFGrATgj";
 
-  final String _goongApiKey = "xxx";
+  final String _goongApiKey = "xdfsmGusMta5D9ICaSarzdmCWWOucKDKiWRbbbaq";
 
   // --- CÁC BIẾN MỚI CHO NAVIGATION ---
 
@@ -68,7 +68,7 @@ class _GoongRoutingMapState extends State<GoongRoutingMap> {
 
   /// Ngưỡng (bằng mét) để coi là "đi lạc"
 
-  static const double OFF_ROUTE_THRESHOLD = 150.0;
+  static const double OFF_ROUTE_THRESHOLD = 50.0;
 
   // --- KẾT THÚC BIẾN MỚI ---
 
@@ -76,7 +76,9 @@ class _GoongRoutingMapState extends State<GoongRoutingMap> {
   void initState() {
     super.initState();
 
-    mapbox.MapboxOptions.setAccessToken("pk.xxx");
+    mapbox.MapboxOptions.setAccessToken(
+      "pk.eyJ1IjoiZHVjLWRheS1uZSIsImEiOiJjbWg0N3ZndGswZmNwMmpuNGN1cTJnYjlxIn0.m0RNPqi3Z6NYjy9_Mr1eEw",
+    );
 
     _loadIcon();
   }
