@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
@@ -6,8 +7,14 @@ import 'package:mapbox_maps_flutter/mapbox_maps_flutter.dart' as mapbox;
 import 'package:geolocator/geolocator.dart';
 import 'dart:math' as math;
 import 'package:flutter/services.dart';
+import 'package:flutter_dotenv/flutter_dotenv.dart'; // <-- THAY ĐỔI 1: IMPORT
 
-void main() {
+Future<void> main() async { // <-- THAY ĐỔI 2: SỬA HÀM MAIN
+  // Đảm bảo Flutter được khởi tạo
+  WidgetsFlutterBinding.ensureInitialized();
+  // Tải file .env
+  await dotenv.load(fileName: ".env");
+  
   runApp(const MaterialApp(home: GoongRoutingMap()));
 }
 
@@ -23,34 +30,59 @@ class _GoongRoutingMapState extends State<GoongRoutingMap> {
   mapbox.PointAnnotationManager? _pointManager;
   mapbox.PolylineAnnotationManager? _polylineManager;
 
-  // THÊM 2 DÒNG NÀY
   List<mapbox.Position> _routeCoordinates = []; // Lưu các điểm của tuyến đường
-  mapbox.PointAnnotation? _userLocationMarker;  // Marker xe hơi để di chuyển
-
-  // THÊM BIẾN NÀY
-  mapbox.PolylineAnnotation? _routePolyline; // Lưu đường line để cập nhật
-  // THÊM BIẾN NÀY
-  Uint8List? _arrowIconData; // Để lưu dữ liệu ảnh icon
+  mapbox.PointAnnotation? _userLocationMarker; // Marker xe hơi
+  mapbox.PolylineAnnotation? _routePolyline; // Lưu đường line
+  Uint8List? _arrowIconData; // Dữ liệu ảnh icon
+  bool _isIconLoaded = false;
 
   final TextEditingController _startCtrl = TextEditingController();
   final TextEditingController _endCtrl = TextEditingController();
 
-  final String _goongMapKey = "xxx";
-  final String _goongApiKey = "xxx";
+  // --- THAY ĐỔI 3: ĐỌC KEY TỪ .ENV ---
+  // Sử dụng dotenv.env['TÊN_BIẾN'] để lấy key
+  // Dùng ?? 'fallback' để phòng trường hợp load .env thất bại
+  final String _goongMapKey = dotenv.env['GOONG_MAP_KEY'] ?? "YOUR_FALLBACK_MAP_KEY";
+  final String _goongApiKey = dotenv.env['GOONG_API_KEY'] ?? "YOUR_FALLBACK_API_KEY";
+  // --- KẾT THÚC THAY ĐỔI 3 ---
+
+
+  // --- CÁC BIẾN MỚI CHO NAVIGATION ---
+  
+  /// Theo dõi stream vị trí
+  StreamSubscription<Position>? _locationSubscription;
+  
+  /// Lưu tọa độ của ĐIỂM ĐẾN (Điểm B)
+  mapbox.Position? _destinationCoords;
+  
+  /// Cờ (flag) để biết có đang trong chế độ điều hướng không
+  bool _isNavigating = false;
+  
+  /// Ngưỡng (bằng mét) để coi là "đi lạc"
+  static const double OFF_ROUTE_THRESHOLD = 150.0; 
+
+  // --- KẾT THÚC BIẾN MỚI ---
 
   @override
   void initState() {
     super.initState();
-    mapbox.MapboxOptions.setAccessToken("pk.xxx");
-    _loadIcon(); // GỌI HÀM LOAD ICON
+    
+    // Đọc key từ .env
+    final String mapboxAccessToken = dotenv.env['ASSCESS_TOKEN'] ?? 'YOUR_FALLBACK_ACCESS_TOKEN';
+    mapbox.MapboxOptions.setAccessToken(mapboxAccessToken);
+    
+    _loadIcon();
   }
 
-  // THÊM HÀM MỚI NÀY
   /// Load icon từ asset
   Future<void> _loadIcon() async {
     try {
-      final ByteData byteData = await rootBundle.load('assets/navigation_arrow.png');
+      final ByteData byteData =
+          await rootBundle.load('assets/navigation_arrow.png');
       _arrowIconData = byteData.buffer.asUint8List();
+      setState(() {
+        _isIconLoaded = true;
+      });
     } catch (e) {
       debugPrint("Lỗi load icon: $e");
     }
@@ -90,9 +122,12 @@ class _GoongRoutingMapState extends State<GoongRoutingMap> {
     return data["results"][0]["formatted_address"];
   }
 
-  /// 🚗 Vẽ tuyến đường từ A -> B
+  /// 🚗 Vẽ tuyến đường từ A -> B (Dùng địa chỉ)
   Future<void> _drawRoute(String start, String end) async {
     if (_mapboxMap == null) return;
+    
+    // Dừng navigation cũ (nếu có)
+    await _stopRealTimeTracking();
 
     final from = await _geocode(start);
     final to = await _geocode(end);
@@ -101,18 +136,48 @@ class _GoongRoutingMapState extends State<GoongRoutingMap> {
       return;
     }
 
+    // --- THÊM DÒNG NÀY ---
+    // Lưu lại tọa độ điểm đến để dùng cho việc re-route
+    _destinationCoords = mapbox.Position(to["lng"]!, to["lat"]!);
+    // --- KẾT THÚC THÊM ---
+
+    final success = await _fetchAndDrawRoute(
+      mapbox.Position(from["lng"]!, from["lat"]!),
+      _destinationCoords!,
+    );
+
+    if (success) {
+      // Focus camera
+      await _mapboxMap?.flyTo(
+        mapbox.CameraOptions(
+          center: mapbox.Point(
+            coordinates: mapbox.Position(
+                (from["lng"]! + to["lng"]!) / 2,
+                (from["lat"]! + to["lat"]!) / 2),
+          ),
+          zoom: 12,
+        ),
+        mapbox.MapAnimationOptions(duration: 1000),
+      );
+    }
+  }
+
+  // --- HÀM MỚI ---
+  /// 🚗 Lấy và vẽ tuyến đường từ TỌA ĐỘ (Dùng cho re-route)
+  Future<bool> _fetchAndDrawRoute(
+      mapbox.Position start, mapbox.Position end) async {
     final url = Uri.parse(
-        "https://rsapi.goong.io/Direction?origin=${from["lat"]},${from["lng"]}&destination=${to["lat"]},${to["lng"]}&vehicle=car&api_key=$_goongApiKey");
+        "https://rsapi.goong.io/Direction?origin=${start.lat},${start.lng}&destination=${end.lat},${end.lng}&vehicle=car&api_key=$_goongApiKey");
     final res = await http.get(url);
     if (res.statusCode != 200) {
       _showSnack("Không lấy được tuyến đường");
-      return;
+      return false;
     }
 
     final data = jsonDecode(res.body);
     if (data["routes"] == null || data["routes"].isEmpty) {
       _showSnack("Không tìm thấy tuyến đường");
-      return;
+      return false;
     }
 
     final encoded = data["routes"][0]["overview_polyline"]["points"];
@@ -121,68 +186,51 @@ class _GoongRoutingMapState extends State<GoongRoutingMap> {
         .map((p) => mapbox.Position(p.longitude, p.latitude))
         .toList();
 
-    // Lưu lại tuyến đường để demo
+    // Lưu lại tuyến đường mới
     _routeCoordinates = coords;
+
+    // ===== IN TUYẾN ĐƯỜNG TỪ GOONG API =====
+    print("--- [GOONG API] Đã nhận tuyến đường mới ---");
+    print("Tổng số điểm: ${_routeCoordinates.length}");
+    for (var pos in _routeCoordinates) {
+      print('Goong Lng: ${pos.lng.toDouble()}, Goong Lat: ${pos.lat.toDouble()}');
+    }
+    print("--- [GOONG API] Kết thúc tuyến đường ---");
+    // =============================================
 
     // Xoá cũ
     await _polylineManager?.deleteAll();
     await _pointManager?.deleteAll();
-
-    // -- SỬA ĐỔI Ở ĐÂY --
     _userLocationMarker = null;
-    _routePolyline = null; // Reset polyline
-    // -- KẾT THÚC SỬA ĐỔI --
+    _routePolyline = null;
 
-    // Vẽ line
-    // await _polylineManager?.create(
-    //   mapbox.PolylineAnnotationOptions(
-    //     geometry: mapbox.LineString(coordinates: coords),
-    //     lineColor: Colors.blue.value,
-    //     lineWidth: 5.0,
-    //   ),
-    // );
-
-    // -- SỬA ĐỔI Ở ĐÂY --
-    _routePolyline = await _polylineManager?.create( // Gán vào biến
+    // Vẽ line mới
+    _routePolyline = await _polylineManager?.create(
       mapbox.PolylineAnnotationOptions(
         geometry: mapbox.LineString(coordinates: coords),
         lineColor: Colors.blue.value,
         lineWidth: 5.0,
       ),
     );
-    // -- KẾT THÚC SỬA ĐỔI --
 
     // Thêm marker Start - End
     await _pointManager?.create(mapbox.PointAnnotationOptions(
-      geometry: mapbox.Point(
-        coordinates: mapbox.Position(from["lng"]!, from["lat"]!),
-      ),
+      geometry: mapbox.Point(coordinates: start),
       textField: "Start",
       textSize: 14,
     ));
     await _pointManager?.create(mapbox.PointAnnotationOptions(
-      geometry: mapbox.Point(
-        coordinates: mapbox.Position(to["lng"]!, to["lat"]!),
-      ),
+      geometry: mapbox.Point(coordinates: end),
       textField: "End",
       textSize: 14,
     ));
 
-    // Focus camera
-    await _mapboxMap?.flyTo(
-      mapbox.CameraOptions(
-        center: mapbox.Point(
-          coordinates: mapbox.Position(
-              (from["lng"]! + to["lng"]!) / 2, (from["lat"]! + to["lat"]!) / 2),
-        ),
-        zoom: 12,
-      ),
-      mapbox.MapAnimationOptions(duration: 1000),
-    );
+    return true;
   }
+  // --- KẾT THÚC HÀM MỚI ---
 
   /// 📍 Định vị người dùng + điền vào ô “Địa chỉ bắt đầu”
-  Future<void> _locateMe() async {
+  Future<bool> _locateMe() async {
     bool serviceEnabled;
     LocationPermission permission;
 
@@ -190,7 +238,7 @@ class _GoongRoutingMapState extends State<GoongRoutingMap> {
     serviceEnabled = await Geolocator.isLocationServiceEnabled();
     if (!serviceEnabled) {
       _showSnack("Vui lòng bật GPS");
-      return;
+      return false;
     }
 
     // Kiểm tra quyền
@@ -199,13 +247,13 @@ class _GoongRoutingMapState extends State<GoongRoutingMap> {
       permission = await Geolocator.requestPermission();
       if (permission == LocationPermission.denied) {
         _showSnack("Bạn đã từ chối quyền vị trí");
-        return;
+        return false;
       }
     }
 
     if (permission == LocationPermission.deniedForever) {
       _showSnack("Quyền vị trí bị chặn vĩnh viễn");
-      return;
+      return false;
     }
 
     // Lấy vị trí hiện tại
@@ -221,6 +269,8 @@ class _GoongRoutingMapState extends State<GoongRoutingMap> {
 
     // Thêm marker
     await _pointManager?.deleteAll();
+    _userLocationMarker = null; // <- Sửa lỗi crash khi đang navigation
+    
     await _pointManager?.create(mapbox.PointAnnotationOptions(
       geometry: mapbox.Point(
         coordinates: mapbox.Position(pos.longitude, pos.latitude),
@@ -239,6 +289,7 @@ class _GoongRoutingMapState extends State<GoongRoutingMap> {
       ),
       mapbox.MapAnimationOptions(duration: 1000),
     );
+    return true;
   }
 
   /// Tính góc (bearing) giữa 2 điểm
@@ -257,94 +308,206 @@ class _GoongRoutingMapState extends State<GoongRoutingMap> {
     return (brng * (180.0 / math.pi) + 360) % 360; // Convert to degrees
   }
 
-  // THÊM HÀM MỚI NÀY
-  /// 🚗 Bắt đầu Demo di chuyển
-  Future<void> _startMockTracking() async {
-    if (_routeCoordinates.isEmpty || 
-        _mapboxMap == null || 
-        _pointManager == null || 
+  // --- HÀM MỚI: BẮT ĐẦU NAVIGATION THỰC TẾ ---
+  Future<void> _startRealTimeTracking() async {
+    if (_routeCoordinates.isEmpty ||
+        _mapboxMap == null ||
+        _pointManager == null ||
         _polylineManager == null ||
+        _destinationCoords == null ||
         _arrowIconData == null) {
       _showSnack("Vui lòng vẽ tuyến đường trước (hoặc icon chưa load xong)");
       return;
     }
 
-    // Xoá marker xe hơi cũ nếu có
+    // Kiểm tra quyền vị trí
+    final hasPermission = await _locateMe();
+    if (!hasPermission) return;
+
+    if (_isNavigating) return; // Đã chạy rồi thì thôi
+
+    setState(() {
+      _isNavigating = true;
+    });
+    _showSnack("Bắt đầu điều hướng!");
+
+    // Xoá marker xe hơi cũ (nếu có)
     if (_userLocationMarker != null) {
-      await _pointManager?.delete(_userLocationMarker!);
+      // Thêm kiểm tra an toàn
+      try {
+        await _pointManager?.delete(_userLocationMarker!);
+      } catch (e) {
+        debugPrint("Lỗi xóa marker cũ (có thể đã bị xóa): $e");
+      }
       _userLocationMarker = null;
     }
 
-    // -- SỬA ĐỔI MARKER TỪ ĐÂY --
     // Tạo marker mũi tên mới tại điểm bắt đầu
     _userLocationMarker = await _pointManager!.create(
       mapbox.PointAnnotationOptions(
         geometry: mapbox.Point(coordinates: _routeCoordinates.first),
-        // DÙNG IMAGE THAY VÌ TEXT
-        image: _arrowIconData!, 
-        iconSize: 0.1, // Kích thước (1.0 là gốc, 2.0 là gấp đôi...)
-        iconRotate: 0.0, // Xoay ban đầu
+        image: _arrowIconData!,
+        iconSize: 0.1,
+        iconRotate: 0.0,
       ),
     );
-    // -- KẾT THÚC SỬA ĐỔI MARKER --
 
-    if (_userLocationMarker == null) return;
+    // Lắng nghe stream vị trí
+    _locationSubscription = Geolocator.getPositionStream(
+      locationSettings: const LocationSettings(
+        accuracy: LocationAccuracy.high, // Yêu cầu độ chính xác cao
+        distanceFilter: 10, // Cập nhật khi di chuyển ít nhất 10 mét
+      ),
+    ).listen((Position userGpsPos) {
+      // Đây là nơi xử lý logic chính
+      _updateNavigation(userGpsPos);
+    }, onError: (e) {
+      _showSnack("Lỗi GPS: $e");
+      _stopRealTimeTracking();
+    });
+  }
 
-    // Lặp qua từng điểm trên tuyến đường
-    // -- SỬA ĐỔI VÒNG LẶP TỪ ĐÂY --
+  // --- HÀM MỚI: DỪNG NAVIGATION ---
+  Future<void> _stopRealTimeTracking() async {
+    // Huỷ lắng nghe stream
+    await _locationSubscription?.cancel();
+    _locationSubscription = null;
+
+    setState(() {
+      _isNavigating = false;
+    });
+
+    // (Tùy chọn) Xóa marker xe
+    // if (_userLocationMarker != null) {
+    // 	try {
+    //   	await _pointManager?.delete(_userLocationMarker!);
+    // 	} catch (e) {
+    // 		debugPrint("Lỗi xóa marker khi dừng: $e");
+    // 	}
+    //   _userLocationMarker = null;
+    // }
+  }
+
+  // --- HÀM MỚI: LOGIC ĐIỀU HƯỚNG CHÍNH ---
+  /// Hàm này được gọi MỖI KHI có vị trí GPS mới
+  Future<void> _updateNavigation(Position userGpsPos) async {
+    if (!_isNavigating || _routePolyline == null) {
+      return;
+    }
+    
+    // Kiểm tra an toàn cho marker
+    if (_userLocationMarker == null) {
+      debugPrint("Marker đã bị null, dừng update.");
+      _stopRealTimeTracking(); // Dừng navigation vì marker đã mất
+      return;
+    }
+
+    final currentUserPos = mapbox.Position(userGpsPos.longitude, userGpsPos.latitude);
+
+    // ===== IN VỊ TRÍ GPS TỪ GEOLOCATOR =====
+    print("--- [GPS] Vị trí GPS hiện tại: Lng: ${currentUserPos.lng.toDouble()}, Lat: ${currentUserPos.lat.toDouble()} ---");
+    // =============================================
+
+    // --- LOGIC SNAP-TO-ROAD (Đơn giản) ---
+    // Tìm điểm gần nhất trên tuyến đường so với vị trí GPS của người dùng
+
+    int closestPointIndex = -1;
+    double minDistance = double.maxFinite;
+
     for (int i = 0; i < _routeCoordinates.length; i++) {
-      // Nếu marker hoặc line bị xoá (do vẽ lại), dừng demo
-      if (_userLocationMarker == null || _routePolyline == null) break;
-
-      final currentPoint = _routeCoordinates[i];
-      double bearing = 0.0; // Hướng mặc định
-
-      // Tính hướng nếu đây không phải là điểm cuối cùng
-      if (i < _routeCoordinates.length - 1) {
-        final nextPoint = _routeCoordinates[i + 1];
-        bearing = _calculateBearing(currentPoint, nextPoint);
-      } else {
-        // Nếu là điểm cuối, giữ nguyên hướng của đoạn trước đó
-        bearing = _userLocationMarker!.iconRotate ?? 0.0;
-      }
-
-      // 1. Cập nhật vị trí và HƯỚNG của marker
-      _userLocationMarker!.geometry = mapbox.Point(coordinates: currentPoint);
-      _userLocationMarker!.iconRotate = bearing; // QUAN TRỌNG: xoay icon
-      await _pointManager!.update(_userLocationMarker!);
-
-      // 2. Cập nhật (rút ngắn) đường polyline
-      final remainingCoords = _routeCoordinates.sublist(i); // Lấy các điểm còn lại
-      _routePolyline!.geometry = mapbox.LineString(coordinates: remainingCoords);
-      await _polylineManager!.update(_routePolyline!);
-
-      // 3. Di chuyển camera theo marker VÀ XOAY camera
-      await _mapboxMap!.flyTo(
-        mapbox.CameraOptions(
-          center: mapbox.Point(coordinates: currentPoint),
-          zoom: 16,
-          bearing: bearing, // QUAN TRỌNG: xoay camera
-        ),
-        mapbox.MapAnimationOptions(duration: 100), // Di chuyển camera mượt
+      final pointOnRoute = _routeCoordinates[i];
+      final distance = Geolocator.distanceBetween(
+        currentUserPos.lat.toDouble(),
+        currentUserPos.lng.toDouble(), 
+        pointOnRoute.lat.toDouble(), 
+        pointOnRoute.lng.toDouble(),
       );
 
-      // Đợi 1 chút trước khi đến điểm tiếp theo
-      await Future.delayed(const Duration(seconds: 1));
+      if (distance < minDistance) {
+        minDistance = distance;
+        closestPointIndex = i;
+      }
     }
-    // -- KẾT THÚC SỬA ĐỔI VÒNG LẶP --
 
-    _showSnack("Đã hoàn thành demo!");
+    // --- LOGIC PHÁT HIỆN ĐI LẠC (OFF-ROUTE) ---
+    if (minDistance > OFF_ROUTE_THRESHOLD && _destinationCoords != null) {
+      _showSnack("Bạn đã đi lạc! Đang tìm lại đường...");
+      
+      // Dừng stream cũ
+      await _stopRealTimeTracking(); 
+
+      // Gọi API vẽ đường mới từ vị trí hiện tại -> điểm đến cũ
+      final success = await _fetchAndDrawRoute(currentUserPos, _destinationCoords!);
+      
+      if(success) {
+        // Bắt đầu lại navigation với tuyến đường mới
+        await _startRealTimeTracking(); 
+      } else {
+        _showSnack("Không thể tìm lại đường mới.");
+      }
+      return; // Dừng xử lý vị trí này
+    }
+
+    // --- CẬP NHẬT UI (NẾU VẪN ĐÚNG ĐƯỜNG) ---
+
+    // 1. Lấy vị trí đã "khớp" (snapped)
+    final snappedPosition = _routeCoordinates[closestPointIndex];
+    double bearing = 0.0;
+
+    // 2. Tính hướng
+    if (closestPointIndex < _routeCoordinates.length - 1) {
+      final nextPoint = _routeCoordinates[closestPointIndex + 1];
+      bearing = _calculateBearing(snappedPosition, nextPoint);
+    } else {
+      bearing = _userLocationMarker!.iconRotate ?? 0.0;
+    }
+
+    // 3. Cập nhật vị trí và HƯỚNG của marker
+    // Thêm một khối try-catch an toàn ở đây
+    try {
+      _userLocationMarker!.geometry = mapbox.Point(coordinates: snappedPosition);
+      _userLocationMarker!.iconRotate = bearing;
+      await _pointManager!.update(_userLocationMarker!);
+
+      // 4. Cập nhật (rút ngắn) đường polyline
+      final remainingCoords = _routeCoordinates.sublist(closestPointIndex);
+      _routePolyline!.geometry = mapbox.LineString(coordinates: remainingCoords);
+      await _polylineManager!.update(_routePolyline!);
+    } catch (e) {
+      debugPrint("Lỗi khi cập nhật marker/polyline (đã bị xóa?): $e");
+      _stopRealTimeTracking(); // Dừng lại nếu có lỗi
+      return;
+    }
+
+
+    // 5. Di chuyển camera
+    await _mapboxMap!.flyTo(
+      mapbox.CameraOptions(
+        center: mapbox.Point(coordinates: snappedPosition),
+        zoom: 16,
+        bearing: bearing, // Xoay camera
+      ),
+      mapbox.MapAnimationOptions(duration: 500),
+    );
   }
 
   void _showSnack(String msg) {
+    if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+  }
+
+  @override
+  void dispose() {
+    // Nhớ huỷ stream khi widget bị huỷ
+    _locationSubscription?.cancel();
+    super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text("Goong Map Routing + Định vị tự động"),
+        title: const Text("Goong Map - Realtime Navigation"),
         actions: [
           IconButton(
             icon: const Icon(Icons.my_location),
@@ -385,16 +548,22 @@ class _GoongRoutingMapState extends State<GoongRoutingMap> {
                       onPressed: () => _drawRoute(
                           _startCtrl.text.trim(), _endCtrl.text.trim()),
                     ),
-                    
-                    // THÊM NÚT NÀY
+
+                    // --- SỬA ĐỔI NÚT NÀY ---
                     ElevatedButton.icon(
-                      icon: const Icon(Icons.drive_eta),
-                      label: const Text("Demo Tracking"),
-                      onPressed: _startMockTracking, // Gọi hàm demo
+                      icon: Icon(_isNavigating ? Icons.stop : Icons.navigation),
+                      label: Text(_isNavigating ? "Dừng" : "Bắt đầu"),
+                      onPressed: _isIconLoaded
+                          ? (_isNavigating
+                              ? _stopRealTimeTracking // Nếu đang chạy, bấm để DỪNG
+                              : _startRealTimeTracking) // Nếu đang dừng, bấm để CHẠY
+                          : null,
                       style: ElevatedButton.styleFrom(
-                        backgroundColor: Colors.green, // Đổi màu cho dễ thấy
+                        backgroundColor: _isNavigating ? Colors.red : Colors.green,
+                        disabledBackgroundColor: Colors.grey.shade400,
                       ),
                     ),
+                    // --- KẾT THÚC SỬA ĐỔI ---
                   ],
                 ),
               ],
